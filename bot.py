@@ -989,8 +989,17 @@ def choice_kb(g, bet):
     return kb(rows)
 
 
-def start_game(chat_id, u, g, bet):
-    if blocked(chat_id, u, for_game=True):
+def testing_blocked(chat_id, u, uid=None):
+    if not get_test_mode():
+        return False
+    if norm(u) in AUTHORIZED_ADMIN_USERNAMES or (uid is not None and uid in admins):
+        return False
+    send(chat_id, "🧪 Бот в режиме тестеровки. Игры временно недоступны.")
+    return True
+
+
+def start_game(chat_id, u, g, bet, uid=None):
+    if testing_blocked(chat_id, u, uid) or blocked(chat_id, u, for_game=True):
         return
     try:
         bet = resolve_bet(u, bet)
@@ -1002,12 +1011,14 @@ def start_game(chat_id, u, g, bet):
     if g in ("hl", "eo", "guess"):
         send(chat_id, f"{GAMES[g]}\nСтавка: {bet} ⭐\n\nВыбери:", choice_kb(g, bet))
     else:
-        play(chat_id, u, g, bet, None)
+        play(chat_id, u, g, bet, None, uid=uid)
 
 
-def play(chat_id, u, g, bet, choice):
+def play(chat_id, u, g, bet, choice, uid=None):
     if g not in GAMES:
         return send(chat_id, "⚠️ Эта игра отключена.")
+    if testing_blocked(chat_id, u, uid):
+        return
     if g == "hl" and choice not in ("high", "low"):
         return send(chat_id, "⚠️ Выбери: б (больше) или м (меньше).")
     if g == "eo" and choice not in ("even", "odd"):
@@ -1676,3 +1687,381 @@ def donatelog(chat_id):
     else:
         parts.append("Пока пусто.")
     send(chat_id, "\n".join(parts)[:3900])
+
+
+_lock_fh = None
+_callback_seen = {}
+
+
+def acquire_instance_lock():
+    global _lock_fh
+    if fcntl is None:
+        return
+    _lock_fh = open(LOCK_FILE, "a+")
+    try:
+        fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("Уже запущен другой экземпляр бота.")
+        raise SystemExit(1)
+    _lock_fh.seek(0)
+    _lock_fh.truncate()
+    _lock_fh.write(str(os.getpid()))
+    _lock_fh.flush()
+
+
+def who(obj):
+    user = (obj or {}).get("from") or {}
+    uid = user.get("id")
+    name = norm(user.get("username")) or (f"id{uid}" if uid else "")
+    return uid, name
+
+
+def cmd_of(text):
+    head = (text or "").strip().split()
+    if not head or not head[0].startswith("/"):
+        return "", []
+    return head[0].split("@", 1)[0].lower(), head[1:]
+
+
+def require_admin(chat_id, uid, u):
+    if is_admin(uid, u):
+        return True
+    send(chat_id, "⚠️ Только для админа. Команда: /admin")
+    return False
+
+
+def show_balance(chat_id, u):
+    bal = ensure_user(u, chat_id)
+    send(
+        chat_id,
+        f"💰 Баланс @{u}: {bal} ⭐",
+        kb([[b("🎮 Меню", "menu"), b("⭐ Пополнить", "topup")]]),
+    )
+
+
+def bot_stars(chat_id):
+    r = api("getMyStarBalance", timeout=15)
+    if not r.get("ok"):
+        return send(chat_id, "⚠️ Не удалось получить Stars бота.")
+    res = r.get("result") or {}
+    amount = res.get("amount", res) if isinstance(res, dict) else res
+    send(chat_id, f"⭐ Stars бота: {amount}", kb([[b("⬅️ Админ-панель", "adm:back")]]))
+
+
+def admin_adjust(chat_id, admin_u, text, take=False):
+    parts = text.replace("@", " ").split()
+    if len(parts) != 2:
+        return send(chat_id, "⚠️ Формат: @username 100")
+    target = norm(parts[0])
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return send(chat_id, "⚠️ Сумма должна быть числом.")
+    if not target or amount <= 0:
+        return send(chat_id, "⚠️ Укажи username и сумму больше 0.")
+    if take and get_balance(target) < amount:
+        return send(chat_id, f"⚠️ У @{target} только {get_balance(target)} ⭐.")
+    new = add_balance(target, -amount if take else amount)
+    verb = "списано" if take else "начислено"
+    send(chat_id, f"✅ @{target}: {verb} {amount} ⭐\n💰 Баланс: {new}")
+    cid = get_chat(target)
+    if cid:
+        send(cid, f"{'➖' if take else '➕'} {verb.capitalize()} {amount} ⭐\n💰 Баланс: {new}")
+    log_group(f"{'➖ Списание' if take else '➕ Начисление'}\n👤 @{target}\n⭐ {amount}\n👮 @{admin_u}")
+
+
+def run_broadcast(chat_id, text):
+    chats = get_chats()
+    if not chats:
+        return send(chat_id, "📢 Получателей пока нет.")
+    for cid in chats.values():
+        send(cid, text)
+    send(chat_id, f"📢 Поставлено в очередь: {len(chats)}")
+
+
+def handle_pending(chat_id, uid, u, text):
+    state = pending.get(uid) or {}
+    kind = state.get("type")
+    if kind == "admin_password":
+        fails = pw_fail.get(uid) or {"n": 0, "until": 0}
+        if fails["until"] > time.time():
+            return send(chat_id, "⚠️ Слишком много попыток. Подожди и попробуй снова.")
+        if ADMIN_PASSWORD and hmac.compare_digest(text.encode(), ADMIN_PASSWORD.encode()):
+            admins.add(uid)
+            pw_fail.pop(uid, None)
+            pending.pop(uid, None)
+            return panel(chat_id)
+        fails["n"] += 1
+        if fails["n"] >= 5:
+            fails["until"] = time.time() + 600
+            fails["n"] = 0
+        pw_fail[uid] = fails
+        return send(chat_id, "⚠️ Неверный пароль.")
+    if kind == "bet":
+        pending.pop(uid, None)
+        return start_game(chat_id, u, state.get("game"), text.strip(), uid=uid)
+    if kind == "topup":
+        pending.pop(uid, None)
+        return invoice(chat_id, u, text.strip())
+    if kind == "wd":
+        pending.pop(uid, None)
+        return create_withdrawal(chat_id, u, text.strip())
+    if kind == "broadcast":
+        pending.pop(uid, None)
+        return run_broadcast(chat_id, text)
+    if kind in ("add", "take"):
+        pending.pop(uid, None)
+        return admin_adjust(chat_id, u, text, take=(kind == "take"))
+    if kind == "playerhistory":
+        pending.pop(uid, None)
+        return player_history(chat_id, text)
+    if kind == "mod_user":
+        pending.pop(uid, None)
+        return moderation_target_panel(chat_id, text)
+    if kind == "withdraw_close_comment":
+        pending.pop(uid, None)
+        return close_withdrawal(chat_id, uid, u, state.get("rid"), text, reject=bool(state.get("reject")))
+    pending.pop(uid, None)
+    send(chat_id, "⚠️ Это действие устарело. Открой меню: /start")
+
+
+def handle_command(chat_id, uid, u, text, chat):
+    cmd, args = cmd_of(text)
+    if cmd in ("/start", "/menu", "/help"):
+        return show_menu(chat_id, u)
+    if cmd in ("/balance", "/bal", "/баланс"):
+        return show_balance(chat_id, u)
+    if cmd in ("/topup", "/пополнить"):
+        return topup_menu(chat_id)
+    if cmd in ("/withdraw", "/вывод"):
+        return withdrawal_menu(chat_id, u)
+    if cmd in ("/my", "/игры"):
+        return my_games(chat_id, u)
+    if cmd in GAME_CMDS:
+        g = GAME_CMDS[cmd]
+        if args:
+            return start_game(chat_id, u, g, args[0], uid=uid)
+        return choose_game(chat_id, u, g)
+    if cmd == "/cancel":
+        pending.pop(uid, None)
+        return show_menu(chat_id, u)
+    if cmd == "/admin":
+        if is_admin(uid, u):
+            return panel(chat_id)
+        pending[uid] = {"type": "admin_password"}
+        return send(chat_id, "🔐 Введи пароль админа:")
+    if cmd == LOG_CMD and is_admin(uid, u):
+        title = (chat or {}).get("title") or LOG_TITLE
+        set_log_chat(chat_id, title, u)
+        return send(chat_id, f"✅ Лог-чат установлен: {title}")
+    send(chat_id, "Напиши /start, чтобы открыть меню.")
+
+
+def route_callback(chat_id, uid, u, data):
+    admin_data = data.startswith(("adm:", "sadm:", "wd:", "mod:"))
+    if admin_data and not require_admin(chat_id, uid, u):
+        return
+    if data == "menu":
+        return show_menu(chat_id, u)
+    if data == "bal":
+        return show_balance(chat_id, u)
+    if data == "my":
+        return my_games(chat_id, u)
+    if data == "topup":
+        return topup_menu(chat_id)
+    if data == "topup_custom":
+        pending[uid] = {"type": "topup"}
+        return send(chat_id, "✍️ Введи сумму пополнения в ⭐:")
+    if data.startswith("topup_amount:"):
+        return invoice(chat_id, u, data.split(":", 1)[1])
+    if data == "withdraw":
+        return withdrawal_menu(chat_id, u)
+    if data == "wd_custom":
+        pending[uid] = {"type": "wd"}
+        return send(chat_id, "✍️ Введи сумму вывода в ⭐:")
+    if data.startswith("wd_amount:"):
+        return create_withdrawal(chat_id, u, data.split(":", 1)[1])
+    if data.startswith("game:"):
+        return choose_game(chat_id, u, data.split(":", 1)[1])
+    if data.startswith("betcustom:"):
+        g = data.split(":", 1)[1]
+        pending[uid] = {"type": "bet", "game": g}
+        return send(chat_id, f"✍️ Введи ставку от {MIN_BET} до {MAX_BET} ⭐:")
+    if data.startswith("bet:"):
+        _, g, bet = data.split(":", 2)
+        return start_game(chat_id, u, g, bet, uid=uid)
+    if data.startswith("play:"):
+        _, g, bet, choice = data.split(":", 3)
+        return play(chat_id, u, g, bet, choice, uid=uid)
+    if data == "adm:back":
+        return panel(chat_id)
+    if data == "adm:list":
+        return players(chat_id)
+    if data == "adm:stats":
+        return admin_stats(chat_id)
+    if data == "adm:history":
+        return history(chat_id)
+    if data == "adm:playerhistory":
+        pending[uid] = {"type": "playerhistory"}
+        return send(chat_id, "🎮 Напиши @username игрока:")
+    if data == "adm:donors":
+        return donors(chat_id)
+    if data == "adm:active":
+        return active(chat_id)
+    if data == "adm:donatelog":
+        return donatelog(chat_id)
+    if data == "adm:moderation":
+        return moderation_panel(chat_id)
+    if data == "adm:testing":
+        return testing_panel(chat_id)
+    if data == "adm:testing_toggle":
+        return toggle_testing(chat_id, u)
+    if data == "adm:withdrawals":
+        return admin_withdrawals(chat_id)
+    if data.startswith("adm:withdrawals:"):
+        kind = data.split(":", 2)[2]
+        if kind == "delete_closed":
+            return delete_closed_withdrawals(chat_id)
+        return admin_withdrawals(chat_id, None if kind == "all" else kind)
+    if data == "adm:broadcast":
+        pending[uid] = {"type": "broadcast"}
+        return send(chat_id, "📢 Напиши текст рассылки. /cancel — отмена.")
+    if data == "adm:add":
+        pending[uid] = {"type": "add"}
+        return send(chat_id, "➕ Напиши: @username 100")
+    if data == "adm:take":
+        pending[uid] = {"type": "take"}
+        return send(chat_id, "➖ Напиши: @username 100")
+    if data == "adm:logout":
+        admins.discard(uid)
+        return send(chat_id, "🚪 Ты вышел из админки.")
+    if data == "sadm:stars":
+        return bot_stars(chat_id)
+    if data == "sadm:withdraw":
+        return send(
+            chat_id,
+            "💸 Stars самого бота выводятся через кабинет StaticGram, не через баланс игрока.",
+            kb([[b("⭐ Stars бота", "sadm:stars")], [b("⬅️ Админ-панель", "adm:back")]]),
+        )
+    if data.startswith("wd:view:"):
+        return admin_view_withdrawal(chat_id, data.split(":", 2)[2])
+    if data.startswith("wd:close:"):
+        return start_close_withdrawal(chat_id, uid, data.split(":", 2)[2], reject=False)
+    if data.startswith("wd:reject:"):
+        return start_close_withdrawal(chat_id, uid, data.split(":", 2)[2], reject=True)
+    if data.startswith("mod:ask:"):
+        pending[uid] = {"type": "mod_user", "action": data.split(":", 2)[2]}
+        return send(chat_id, "🛡 Напиши @username:")
+    if data.startswith("mod:do:"):
+        parts = data.split(":")
+        action = parts[2] if len(parts) > 2 else ""
+        target = parts[3] if len(parts) > 3 else ""
+        duration = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+        return moderate(chat_id, u, target, action, duration)
+    send(chat_id, "⚠️ Кнопка устарела. Открой меню: /start", menu())
+
+
+def handle_message(m):
+    if m.get("successful_payment"):
+        return successful(m)
+    chat = m.get("chat") or {}
+    chat_id = chat.get("id")
+    uid, u = who(m)
+    text = (m.get("text") or "").strip()
+    if not chat_id or not u or not text:
+        return
+    ensure_user(u, chat_id)
+    cmd, _ = cmd_of(text)
+    if chat.get("type") != "private":
+        if cmd == LOG_CMD and is_admin(uid, u):
+            set_log_chat(chat_id, chat.get("title") or LOG_TITLE, u)
+            send(chat_id, f"✅ Лог-чат установлен: {chat.get('title') or chat_id}")
+        return
+    if norm(u) not in AUTHORIZED_ADMIN_USERNAMES and blocked(chat_id, u):
+        return
+    if cmd:
+        pending.pop(uid, None)
+        return handle_command(chat_id, uid, u, text, chat)
+    if uid in pending:
+        return handle_pending(chat_id, uid, u, text)
+    send(chat_id, "Напиши /start, чтобы открыть меню.")
+
+
+def handle_callback(cq):
+    qid = cq.get("id")
+    now = time.time()
+    if qid in _callback_seen and now - _callback_seen[qid] < 3600:
+        api("answerCallbackQuery", callback_query_id=qid, retries=0, timeout=5)
+        return
+    _callback_seen[qid] = now
+    if len(_callback_seen) > 4000:
+        old = [k for k, t in _callback_seen.items() if now - t > 3600]
+        for k in old:
+            _callback_seen.pop(k, None)
+    api("answerCallbackQuery", callback_query_id=qid, retries=1, timeout=8)
+    msg = cq.get("message") or {}
+    chat_id = (msg.get("chat") or {}).get("id")
+    uid, u = who(cq)
+    data = cq.get("data") or ""
+    if not chat_id or not u:
+        return
+    ensure_user(u, chat_id)
+    route_callback(chat_id, uid, u, data)
+
+
+def handle_update(upd):
+    if "message" in upd:
+        handle_message(upd["message"])
+    elif "callback_query" in upd:
+        handle_callback(upd["callback_query"])
+    elif "pre_checkout_query" in upd:
+        precheckout(upd["pre_checkout_query"])
+
+
+def main():
+    if not BOT_TOKEN:
+        print("Задай BOT_TOKEN.")
+        raise SystemExit(1)
+    acquire_instance_lock()
+    init_db()
+    me = api("getMe", retries=2, timeout=20)
+    if not me.get("ok"):
+        print("Бот не авторизован:", str(me.get("description") or me)[:300])
+        raise SystemExit(1)
+    name = (me.get("result") or {}).get("username")
+    print(f"Бот @{name} запущен")
+    api("deleteWebhook", drop_pending_updates=False, retries=1, timeout=15)
+    recover_inflight()
+    offset = None
+    conflicts = 0
+    while True:
+        upd = api(
+            "getUpdates",
+            retries=POLL_RETRIES,
+            timeout=HTTP_TIMEOUT + 5,
+            poll=POLL_TIMEOUT,
+            offset=offset,
+            allowed_updates=["message", "callback_query", "pre_checkout_query"],
+        )
+        if not upd.get("ok"):
+            if upd.get("conflict") or upd.get("error_code") == 409:
+                conflicts += 1
+                print(f"Конфликт getUpdates ({conflicts})")
+                if conflicts >= CONFLICT_EXIT_AFTER:
+                    print("Обновления уже забирает другой процесс.")
+                    raise SystemExit(1)
+            else:
+                conflicts = 0
+            time.sleep(1)
+            continue
+        conflicts = 0
+        for item in upd.get("result") or []:
+            offset = item["update_id"] + 1
+            try:
+                handle_update(item)
+            except Exception:
+                traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
