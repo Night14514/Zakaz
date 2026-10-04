@@ -8,8 +8,15 @@ try:
 except ImportError:
     fcntl = None
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "1780243378:m-J5FopJEBzXUHR2zOLopC7oaw73o-mbg2y")
+DEFAULT_BOT_TOKEN = "1780243378:m-J5FopJEBzXUHR2zOLopC7oaw73o-mbg2y"
 API_URL = "https://api.staticgram.top"
+
+
+def clean_token(value):
+    return (value or "").strip().strip('"').strip("'")
+
+
+BOT_TOKEN = clean_token(os.getenv("BOT_TOKEN")) or DEFAULT_BOT_TOKEN
 DB_PATH = "bot.db"
 LOCK_FILE = ".bot_instance.lock"
 
@@ -2018,15 +2025,36 @@ def handle_update(upd):
         precheckout(upd["pre_checkout_query"])
 
 
+def _unauthorized(result):
+    if not isinstance(result, dict):
+        return False
+    if result.get("error_code") == 401:
+        return True
+    return "unauthorized" in str(result.get("description") or "").lower()
+
+
 def main():
+    global BOT_TOKEN
+    env_token = clean_token(os.getenv("BOT_TOKEN"))
+    BOT_TOKEN = env_token or DEFAULT_BOT_TOKEN
     if not BOT_TOKEN:
         print("Задай BOT_TOKEN.")
         raise SystemExit(1)
+    env_api = (os.getenv("API_URL") or "").strip().rstrip("/")
+    if env_api and "staticgram.top" not in env_api:
+        print(f"API_URL={env_api} пропущен: токен StaticGram на api.telegram.org даёт 401.")
     acquire_instance_lock()
     init_db()
     me = api("getMe", retries=2, timeout=20)
+    if _unauthorized(me) and BOT_TOKEN != DEFAULT_BOT_TOKEN:
+        print("Токен из BOT_TOKEN на хосте отклонён (401 Unauthorized). Беру токен из файла.")
+        BOT_TOKEN = DEFAULT_BOT_TOKEN
+        me = api("getMe", retries=2, timeout=20)
     if not me.get("ok"):
-        print("Бот не авторизован:", str(me.get("description") or me)[:300])
+        if _unauthorized(me):
+            print("401 Unauthorized: StaticGram не принял токен. Нужен токен @BotFather из StaticGram, не из Telegram.")
+        else:
+            print("Бот не авторизован:", str(me.get("description") or me)[:300])
         raise SystemExit(1)
     name = (me.get("result") or {}).get("username")
     print(f"Бот @{name} запущен")
