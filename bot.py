@@ -8,14 +8,14 @@ try:
 except ImportError:
     fcntl = None
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "1780243378:m-J5FopJEBzXUHR2zOLopC7oaw73o-mbg2y")
 API_URL = "https://api.staticgram.top"
 DB_PATH = "bot.db"
 LOCK_FILE = ".bot_instance.lock"
 
 OWNER_USERNAME = "jumka"
 AUTHORIZED_ADMIN_USERNAMES = {"jumka"}
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "CzML4O7xP5")
 
 LOG_CMD = "/logu"
 LOG_TITLE = "логи"
